@@ -1,0 +1,135 @@
+import logging
+import os
+import stat
+import tempfile
+from pathlib import Path
+
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool
+from langgraph.types import Command
+
+from deerflow.config.agents_config import SOUL_FILENAME, validate_agent_name
+from deerflow.config.paths import get_paths
+from deerflow.knowledge_scope import canonicalize_knowledge_scope
+from deerflow.persistence.agents import get_agent_store
+from deerflow.runtime.user_context import resolve_runtime_user_id
+from deerflow.tools.types import Runtime
+from deerflow.utils.atomic_write import cleanup_failed_atomic_write
+
+logger = logging.getLogger(__name__)
+
+
+def _publish_text(target: Path, text: str) -> None:
+    """Publish *text* at *target* so no reader ever observes a half-written file.
+
+    A truncating write destroys the previous file before the new content
+    lands, so an interrupted write leaves a truncated SOUL.md — the persona
+    file the prompt builder reads on every run — instead of the old one. The
+    custom-agent store already publishes the same file through a staged
+    temporary plus ``os.replace``; the default agent's copy must not be the
+    one that can tear.
+
+    The temporary carries the target's mode (0644 for a first publish) before
+    the replace, so a re-publish keeps the mode an operator set on the file,
+    and one try/finally spans staging and publishing so a failure in either
+    phase cannot orphan the temporary in ``base_dir``.
+    """
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    except OSError:
+        mode = 0o644
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=target.parent, suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.chmod(temporary, mode)
+            os.fsync(handle.fileno())
+        temporary.replace(target)
+    finally:
+        if temporary is not None:
+            # The publish outcome is already decided; a temp we cannot discard
+            # must not replace it with the cleanup error.
+            cleanup_failed_atomic_write(temporary)
+
+
+@tool(parse_docstring=True)
+def setup_agent(
+    soul: str,
+    description: str,
+    runtime: Runtime,
+    skills: list[str] | None = None,
+) -> Command:
+    """Setup the custom DeerFlow agent.
+
+    Args:
+        soul: Full SOUL.md content defining the agent's personality and behavior.
+        description: One-line description of what the agent does.
+        skills: Optional list of skill names this agent should use. None means use all enabled skills, empty list means no skills.
+    """
+
+    # Reject empty / whitespace-only soul before touching the filesystem.
+    # Without this guard the tool would happily persist an empty SOUL.md and
+    # still report success, which caused the frontend to enter the "agent
+    # created" state for an unusable agent (issue #3549). Failing loud lets
+    # the model retry instead of silently producing a broken artifact and,
+    # together with the upstream agent_name fix, prevents the global default
+    # SOUL.md from being overwritten with empty content.
+    if not soul or not soul.strip():
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content="Error: soul content is empty; refusing to create agent with an empty SOUL.md",
+                        tool_call_id=runtime.tool_call_id,
+                    )
+                ]
+            }
+        )
+
+    agent_name: str | None = runtime.context.get("agent_name") if runtime.context else None
+
+    try:
+        agent_name = validate_agent_name(agent_name)
+        if agent_name:
+            # Custom agents are persisted under the current user's bucket (via
+            # the configured store — file or db) so different users, and
+            # different nodes, resolve the same agent. setup is idempotent, so
+            # this is an upsert.
+            user_id = resolve_runtime_user_id(runtime)
+            config_data: dict = {"name": agent_name}
+            store = get_agent_store()
+            try:
+                existing = store.get(agent_name, user_id=user_id)
+            except FileNotFoundError:
+                pass  # First bootstrap has no user-authored label to preserve.
+            else:
+                if existing.knowledge_scope is not None:
+                    config_data["knowledge_scope"] = canonicalize_knowledge_scope(existing.knowledge_scope)
+                if existing.display_name is not None:
+                    config_data["display_name"] = existing.display_name
+            if description:
+                config_data["description"] = description
+            if skills is not None:
+                config_data["skills"] = skills
+            store.update(agent_name, config_data, soul, user_id=user_id)
+        else:
+            # Default agent (no agent_name): SOUL.md lives at the global base
+            # dir. It is not a custom-agent record, so it stays file-based
+            # regardless of the agent-storage backend.
+            paths = get_paths()
+            paths.base_dir.mkdir(parents=True, exist_ok=True)
+            _publish_text(paths.base_dir / SOUL_FILENAME, soul)
+
+        logger.info(f"[agent_creator] Created agent '{agent_name}'")
+        return Command(
+            update={
+                "created_agent_name": agent_name,
+                "messages": [ToolMessage(content=f"Agent '{agent_name}' created successfully!", tool_call_id=runtime.tool_call_id)],
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"[agent_creator] Failed to create agent '{agent_name}': {e}", exc_info=True)
+        return Command(update={"messages": [ToolMessage(content=f"Error: {e}", tool_call_id=runtime.tool_call_id)]})
